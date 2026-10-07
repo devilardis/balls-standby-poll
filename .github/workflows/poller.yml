@@ -44,9 +44,9 @@ jobs:
           done
           echo "ok polls: $ok/20"
           [ "$ok" -eq 0 ] && { echo "all polls failed"; exit 1; }
-          tar czf "out/poll-$(date -u +%Y%m%dT%H%M%SZ).tar.gz" -C out .
           mkdir -p drop
-          mv out/poll-*.tar.gz drop/
+          tar czf "drop/poll-$(date -u +%Y%m%dT%H%M%SZ).tar.gz" -C out .
+          ls -la drop
       - name: commit to data repo
         env:
           DATA_REPO: ${{ secrets.DATA_REPO }}
