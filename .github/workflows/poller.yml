@@ -2,11 +2,11 @@
 #
 # 放置于【公共】调度仓库 .github/workflows/poller.yml(公共仓 = 无限 Actions 分钟)。
 # 每轮 cron 触发后在本 job 内值守循环 20 拍 × 15s(Actions 启动延迟不影响拍间隔,
-# 每轮覆盖自己的 5 分钟窗口);轮询结果打成一个 tar.gz 提交到【私有】数据仓库。
+# 每轮覆盖自己的 5 分钟窗口);轮询结果打成一个 tar.gz 用 git push 提交到【私有】数据仓库。
 # 整轮被跳过 = 该 5 分钟缺口,run 历史即覆盖日志(标准 §12.2)。
 #
 # 需要的 Secrets(调度仓库 Settings → Secrets and variables → Actions):
-#   WORKER_URL      CF Worker 地址,如 https://balls-poll.<子域>.workers.dev
+#   WORKER_URL      CF Worker 地址,如 https://balls-poll.53129661.workers.dev
 #   POLL_TOKEN      与 Worker 的 POLL_TOKEN secret 相同的口令
 #   DATA_REPO       私有数据仓库,如 devilardis/balls-standby-data
 #   DATA_REPO_TOKEN 有该私有仓库 contents:write 的 fine-grained token
@@ -34,7 +34,7 @@ jobs:
           ok=0
           for i in $(seq 1 20); do
             ts=$(date -u +%Y%m%dT%H%M%SZ)
-            if curl -sS -m 20 -H "x-poll-token: $POLL_TOKEN" \
+            if curl -sS -f -m 20 -H "x-poll-token: $POLL_TOKEN" \
                  -o "out/${ts}.json.gz" "$WORKER_URL/poll"; then
               ok=$((ok+1))
             else
@@ -47,43 +47,28 @@ jobs:
           mkdir -p drop
           tar czf "drop/poll-$(date -u +%Y%m%dT%H%M%SZ).tar.gz" -C out .
           ls -la drop
-      - name: commit to data repo
+      - name: commit to data repo (git push)
         env:
           DATA_REPO: ${{ secrets.DATA_REPO }}
           DATA_REPO_TOKEN: ${{ secrets.DATA_REPO_TOKEN }}
         run: |
-          set -e
+          set -euo pipefail
           F=$(ls drop/*.tar.gz | head -1)
           NAME=$(basename "$F")
-          DAY=$(echo "$NAME" | cut -c1-8)
-          API="https://api.github.com"
-          AUTH="Authorization: token $DATA_REPO_TOKEN"
-          CT="Content-Type: application/json"
-          # 空仓库引导:无 main 分支时先造初始提交
-          REF=$(curl -sS -H "$AUTH" "$API/repos/$DATA_REPO/git/ref/heads/main")
-          HEAD_SHA=$(echo "$REF" | jq -r '.object.sha // empty')
-          if [ -z "$HEAD_SHA" ]; then
-            EMPTY=$(curl -sS -H "$AUTH" -X POST -H "$CT" \
-              -d '{"content":"","encoding":"base64"}' "$API/repos/$DATA_REPO/git/blobs" | jq -r .sha)
-            TREE=$(curl -sS -H "$AUTH" -X POST -H "$CT" \
-              -d "{\"tree\":[{\"path\":\".keep\",\"mode\":\"100644\",\"type\":\"blob\",\"sha\":\"$EMPTY\"}]}" \
-              "$API/repos/$DATA_REPO/git/trees" | jq -r .sha)
-            ROOT=$(curl -sS -H "$AUTH" -X POST -H "$CT" \
-              -d "{\"message\":\"init\",\"tree\":\"$TREE\"}" "$API/repos/$DATA_REPO/git/commits" | jq -r .sha)
-            curl -sS -H "$AUTH" -X POST -H "$CT" \
-              -d "{\"ref\":\"refs/heads/main\",\"sha\":\"$ROOT\"}" "$API/repos/$DATA_REPO/git/refs" > /dev/null
-            HEAD_SHA=$ROOT
+          DAY=$(echo "$NAME" | cut -d- -f2 | cut -c1-8)
+          mkdir datarepo
+          cd datarepo
+          git init -q -b main
+          git config user.email "balls-standby@local"
+          git config user.name "balls-standby"
+          git remote add origin "https://x-access-token:${DATA_REPO_TOKEN}@github.com/${DATA_REPO}.git"
+          git fetch -q origin main || echo "empty repo, first commit"
+          if git rev-parse -q --verify FETCH_HEAD > /dev/null 2>&1; then
+            git reset -q --hard FETCH_HEAD
           fi
-          BASE_TREE=$(curl -sS -H "$AUTH" "$API/repos/$DATA_REPO/git/commits/$HEAD_SHA" | jq -r .tree.sha)
-          BLOB=$(curl -sS -H "$AUTH" -X POST -H "$CT" \
-            -d "{\"content\":\"$(base64 -w0 "$F")\",\"encoding\":\"base64\"}" \
-            "$API/repos/$DATA_REPO/git/blobs" | jq -r .sha)
-          TREE=$(curl -sS -H "$AUTH" -X POST -H "$CT" \
-            -d "{\"base_tree\":\"$BASE_TREE\",\"tree\":[{\"path\":\"data/$DAY/$NAME\",\"mode\":\"100644\",\"type\":\"blob\",\"sha\":\"$BLOB\"}]}" \
-            "$API/repos/$DATA_REPO/git/trees" | jq -r .sha)
-          NEW=$(curl -sS -H "$AUTH" -X POST -H "$CT" \
-            -d "{\"message\":\"poll $NAME\",\"tree\":\"$TREE\",\"parents\":[\"$HEAD_SHA\"]}" \
-            "$API/repos/$DATA_REPO/git/commits" | jq -r .sha)
-          curl -sS -H "$AUTH" -X PATCH -H "$CT" \
-            -d "{\"sha\":\"$NEW\"}" "$API/repos/$DATA_REPO/git/refs/heads/main" > /dev/null
+          mkdir -p "data/$DAY"
+          cp "../$F" "data/$DAY/$NAME"
+          git add data
+          git commit -qm "poll $NAME"
+          git push -q origin main:main
           echo "committed data/$DAY/$NAME"
