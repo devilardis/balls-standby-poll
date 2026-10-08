@@ -10,6 +10,10 @@
 #   POLL_TOKEN      与 Worker 的 POLL_TOKEN secret 相同的口令
 #   DATA_REPO       私有数据仓库,如 devilardis/balls-standby-data
 #   DATA_REPO_TOKEN 有该私有仓库 contents:write 的 fine-grained token
+# 可选(二期,www 比分时间线断档补全;不加该 Secret 则行为与一期完全一致):
+#   SCORE_POLL      设为 "1" 启用:每轮在值守循环外加一拍 /pollscore(www 列表页,
+#                   ≈250KB gzip),打包进同一 tar.gz 的 scores/ 前缀。
+#                   频率=5 分钟一拍(0.003 req/s,风控下限 60s 的 12 倍余量,§6.1 合规)。
 name: standby-poll
 on:
   schedule:
@@ -29,6 +33,7 @@ jobs:
         env:
           WORKER_URL: ${{ secrets.WORKER_URL }}
           POLL_TOKEN: ${{ secrets.POLL_TOKEN }}
+          SCORE_POLL: ${{ secrets.SCORE_POLL }}
         run: |
           mkdir -p out
           ok=0
@@ -44,6 +49,16 @@ jobs:
           done
           echo "ok polls: $ok/20"
           [ "$ok" -eq 0 ] && { echo "all polls failed"; exit 1; }
+          if [ "${SCORE_POLL:-0}" = "1" ]; then
+            ts=$(date -u +%Y%m%dT%H%M%SZ)
+            mkdir -p out/scores
+            if curl -sS -f -m 40 -H "x-poll-token: $POLL_TOKEN" \
+                 -o "out/scores/score-${ts}.html.gz" "$WORKER_URL/pollscore"; then
+              echo "score poll ok"
+            else
+              echo "score poll failed (non-fatal; worker 未部署 /pollscore 或源站抖动)"
+            fi
+          fi
           mkdir -p drop
           tar czf "drop/poll-$(date -u +%Y%m%dT%H%M%SZ).tar.gz" -C out .
           ls -la drop
