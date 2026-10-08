@@ -1,0 +1,88 @@
+# standby/archiver.yml — 数据仓月度归档自动化(GitHub Actions)
+#
+# 放置于【公共】调度仓库 .github/workflows/archiver.yml(与 poller.yml 同仓,直接复用其 Secrets)。
+# 每月 2 日凌晨(北京)自动执行标准 §12.3 的月度运维:
+#   1. 把【上个月】的 data/YYYYMM/ 打包挂到私有数据仓库的 Release 附件(归档,永久保存);
+#   2. 附件校验通过后,把 main 压平成单提交(丢弃已归档月份的历史,防 git 对象无限膨胀)。
+# 安全设计:
+#   · 只归档上个月——此时两台实例的小时级回补必然已消费完(水位天然越过),
+#     README 里"月度 squash 前须确认主程序水位已越过"的人工检查在月度节奏下自动成立;
+#   · 先归档后压平,附件大小校验不过绝不 force-push(数据零丢失);
+#   · Release 已存在则幂等跳过创建、重传附件(--clobber),任务可安全重跑;
+#   · 压平后若需旧数据,Release 附件永久在,可手动解包补导。
+# 体量适配: 月包 >1.9GB(单附件上限 2GB 留余量)自动降级为按天拆分多附件
+#   (启用 www 比分二期后数据仓约 +70MB/日,月包可能触发此路径)。
+# 需要的 Secrets(与 poller.yml 完全相同,无新增): DATA_REPO, DATA_REPO_TOKEN
+name: standby-archive
+on:
+  schedule:
+    - cron: "0 21 1 * *"   # 每月 1 日 21:00 UTC = 北京时间每月 2 日 05:00
+  workflow_dispatch:
+permissions:
+  contents: read
+concurrency:
+  group: standby-archive
+  cancel-in-progress: false
+jobs:
+  archive:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - name: pack prev month → release → squash history
+        env:
+          DATA_REPO: ${{ secrets.DATA_REPO }}
+          DATA_REPO_TOKEN: ${{ secrets.DATA_REPO_TOKEN }}
+          GH_TOKEN: ${{ secrets.DATA_REPO_TOKEN }}
+        run: |
+          set -euo pipefail
+          PREV=$(date -u -d "last month" +%Y%m)
+          echo "archiving month $PREV"
+          rm -rf repo && mkdir repo && cd repo
+          git init -q -b main
+          git config user.email "balls-standby@local"
+          git config user.name "balls-standby"
+          git remote add origin "https://x-access-token:${DATA_REPO_TOKEN}@github.com/${DATA_REPO}.git"
+          git fetch -q origin main
+          git reset -q --hard FETCH_HEAD
+          if [ ! -d "data/$PREV" ]; then
+            echo "data/$PREV not found (already archived or empty month); nothing to do"
+            exit 0
+          fi
+          RELEASE="archive-$PREV"
+          if gh release view "$RELEASE" -R "$DATA_REPO" > /dev/null 2>&1; then
+            echo "release $RELEASE exists (rerun); will refresh assets"
+          fi
+          TOTAL=$(du -sb "data/$PREV" | cut -f1)
+          echo "month size: $TOTAL bytes"
+          if [ "$TOTAL" -le 1900000000 ]; then
+            ATTACH="data-$PREV.tar.gz"
+            tar czf "$ATTACH" "data/$PREV"
+            SIZE=$(stat -c%s "$ATTACH")
+            gh release create "$RELEASE" "$ATTACH" -R "$DATA_REPO" \
+              --title "archive $PREV" --notes "monthly bundle of data/$PREV (auto)" || true
+            gh release upload "$RELEASE" "$ATTACH" -R "$DATA_REPO" --clobber
+            GOT=$(gh release view "$RELEASE" -R "$DATA_REPO" --json assets \
+                    --jq ".assets[] | select(.name==\"$ATTACH\") | .size")
+            [ "$GOT" = "$SIZE" ] || { echo "asset size mismatch ($GOT != $SIZE)"; exit 1; }
+          else
+            echo "month too large for single attachment; splitting per day"
+            for d in data/$PREV/*/; do
+              day=$(basename "$d")
+              tar czf "data-$PREV-$day.tar.gz" "data/$PREV/$day"
+            done
+            gh release create "$RELEASE" data-$PREV-*.tar.gz -R "$DATA_REPO" \
+              --title "archive $PREV (split by day)" \
+              --notes "monthly bundle of data/$PREV, split per day (auto)" || true
+            gh release upload "$RELEASE" data-$PREV-*.tar.gz -R "$DATA_REPO" --clobber
+            N=$(gh release view "$RELEASE" -R "$DATA_REPO" --json assets --jq ".assets | length")
+            EXPECT=$(ls data-$PREV-*.tar.gz | wc -l)
+            [ "$N" -ge "$EXPECT" ] || { echo "asset count mismatch ($N < $EXPECT)"; exit 1; }
+          fi
+          echo "release verified; pruning $PREV from git and squashing history"
+          git rm -rq "data/$PREV"
+          git commit -qm "archive $PREV to release $RELEASE; prune from git"
+          git checkout -q --orphan fresh
+          git add -A
+          git commit -qm "squash: single commit after archiving $PREV"
+          git push -q --force origin fresh:main
+          echo "done: release $RELEASE + history squashed"
